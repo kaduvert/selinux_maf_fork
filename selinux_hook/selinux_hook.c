@@ -1445,10 +1445,23 @@ static void uninstall_inline_hooks(void)
     g_hooks = 0;
 }
 
-/* Hook: selinux_setprocattr(name, value, size) clean-policy wrapper */
-static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
+/* Hook: selinux_setprocattr(name, value, size) clean-policy wrapper
+ *
+ * On kernels >= 4.14 the task_struct argument was dropped upstream:
+ *   selinux_setprocattr(const char *name, void *value, size_t size)
+ *
+ * On msm-4.9 (LineageOS Pixel 3/3a) the old 4-arg form persists even after
+ * the selinux_state backport:
+ *   selinux_setprocattr(struct task_struct *p, const char *name, void *value, size_t size)
+ *
+ * We key on kver to pick the right arg slot for "name".
+ */
+static void before_selinux_setprocattr_clean_eval(hook_fargs4_t *a, void *u)
 {
-    const char *name = (const char *)a->arg0;
+    /* kver < 4.14: arg0=task_struct, arg1=name; else arg0=name */
+    const char *name = (kver < VERSION(4, 14, 0))
+                       ? (const char *)a->arg1
+                       : (const char *)a->arg0;
     uid_t uid = current_uid();
     u32 n;
 
@@ -1458,9 +1471,9 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
     if (n < 16) {
         n++;
         WRITE_ONCE(g_selinux_setprocattr_probe_count, n);
-        pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
+        pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu name=%s\n",
                 n, current_uid(), current_comm(), (void *)a->arg0,
-                (void *)a->arg1, (size_t)a->arg2);
+                (void *)a->arg1, (size_t)a->arg2, name ?: "(null)");
     }
 
     if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
@@ -1470,7 +1483,7 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
         a->local.data0 = 1;
 }
 
-static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
+static void after_selinux_setprocattr_clean_eval(hook_fargs4_t *a, void *u)
 {
     if (a->local.data0)
         leave_clean_eval_scope();
@@ -1650,9 +1663,13 @@ static long init(const char *args, const char *event, void *__user r)
         if (addr) {
             record_inline_hook((void *)addr, before_selinux_setprocattr_clean_eval,
                                after_selinux_setprocattr_clean_eval);
-            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3 clean-eval\n");
-            hook_wrap((void *)addr, 3, before_selinux_setprocattr_clean_eval,
-                      after_selinux_setprocattr_clean_eval, NULL);
+            {
+                /* Pre-4.14 keeps (task_struct*, name, value, size) = 4 args */
+                int spa_argc = (kver < VERSION(4, 14, 0)) ? 4 : 3;
+                pr_info("[selinux_hook] hook selinux_setprocattr argc=%d clean-eval\n", spa_argc);
+                hook_wrap((void *)addr, spa_argc, before_selinux_setprocattr_clean_eval,
+                          after_selinux_setprocattr_clean_eval, NULL);
+            }
         } else {
             pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
         }
