@@ -1,75 +1,61 @@
-name: Build CI
+name: Build
 
 on:
   push:
+    branches: ["**"]
     paths:
+      - "selinux_hook/**"
       - ".github/workflows/build-kpm.yml"
-      - "**.c"
-
+  pull_request:
+    paths:
+      - "selinux_hook/**"
   workflow_dispatch:
     inputs:
       release:
-        description: 'Push a new release'
+        description: 'Create a release'
         required: false
         default: 'false'
-      version:
-        description: 'release version'
+      tag:
+        description: 'Release tag (e.g. v1.1.9-msm49)'
         required: false
-        default: '2024051900'
+        default: ''
 
 jobs:
-  Build-on-Ubuntu:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      TZ: UTC-8
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
-          fetch-depth: 1
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Update system and install dependencies
+      - name: Build
         run: |
-          sudo apt update -y
-
-      - name: Install Compiler
-        run: |
-          curl -o arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
-          tar -Jxf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
-
-      - name: Build kpm
-        env:
-          TARGET_COMPILE: ${{ github.workspace }}/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
-        run: |
-          mkdir target
-
-          for dir in $(ls -d */ | grep -v '^KernelPatch/$\|^target/$\|^arm-gnu-toolchain'); do
-            make -C ${dir}
-            mv ${dir}*.kpm target
-          done
+          mkdir -p target
+          # ANDROID_NDK_LATEST_HOME is already set on ubuntu-latest runners;
+          # the Makefile picks it up automatically via NDK_PATH.
+          make -C selinux_hook
+          cp selinux_hook/*.kpm target/
 
       - name: Upload artifact
-        if: success()
-        uses: lzghzr/upload-artifact@405e6269d5b1feb22bf2a044deb7950596bed6da
+        uses: actions/upload-artifact@v4
         with:
-          path: "target/*.kpm"
-          artifact-per-file: true
-          artifact-name-rule: ${name}
+          name: selinux_hook-kpm
+          path: target/*.kpm
+          retention-days: 30
 
-      - name: Upload release
-        if: github.event.inputs.release == 'true' && success() && !cancelled()
-        uses: ncipollo/release-action@v1.14.0
+      - name: Release
+        if: github.event.inputs.release == 'true' && github.event.inputs.tag != ''
+        uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          name: ${{ github.event.inputs.version }}
-          tag: ${{ github.event.inputs.version }}
-          body: This release is built by github-action.
-          artifacts: "target/*.kpm"
+          tag: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          artifacts: target/*.kpm
           allowUpdates: true
           makeLatest: true
-          omitBodyDuringUpdate: true
           replacesArtifacts: true

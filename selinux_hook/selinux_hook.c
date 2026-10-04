@@ -404,6 +404,17 @@ static bool selinux_compat_call_needed(void)
 
 static bool selinux_state_arg_required(void)
 {
+    /*
+     * The original check was >= 4.14 because Google's documented selinux_state
+     * backport targets msm-4.14. However, LineageOS/android_kernel_google_msm-4.9
+     * (Pixel 3/3a, lineage-22.x) also received this backport from Android 11.
+     *
+     * Use runtime symbol presence instead of a pure version gate: if
+     * g_selinux_state resolved, the kernel has the stateful helper ABI
+     * (selinux_state* as first argument) regardless of whether kver is 4.9 or 4.14.
+     */
+    if (g_selinux_state)
+        return kver < VERSION(6, 4, 0);
     return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
