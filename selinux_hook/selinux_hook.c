@@ -404,6 +404,8 @@ static bool selinux_compat_call_needed(void)
 
 static bool selinux_state_arg_required(void)
 {
+	if (g_selinux_state)
+        return kver < VERSION(6, 4, 0);
     return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
