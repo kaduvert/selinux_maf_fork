@@ -90,6 +90,66 @@ static void *g_clean_policydb;
 static u32 g_clean_eval_depth;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_policy_capture_in_progress;
+/*
+ * Set on first blocked userdebug-expansion probe.  Used for one-shot
+ * diagnostic log only — not a security gate.
+ */
+static bool g_userdebug_expansion_detected;
+
+/*
+ * is_userdebug_expansion_access_query / _context_query
+ *
+ * Userdebug ROMs carry extra SELinux rules that are absent from user builds:
+ *   shell → su          (process:transition)
+ *   adbd  → adbroot     (binder perms)
+ *
+ * Detection tools probe /sys/fs/selinux/access (and /context) for these to
+ * fingerprint the ROM as userdebug.  In NORMAL mode the clean policydb eval
+ * correctly returns ALLOWED (the rules ARE in the clean policy), so the
+ * standard policydb-redirect path does not suppress them.  We intercept them
+ * here and return -EINVAL, matching the behaviour on a non-debug ROM where
+ * u:r:su:s0 / u:r:adbroot:s0 simply do not exist in the policy.
+ *
+ * Substring tokens chosen to be unambiguous in standard Android SELinux
+ * label space:
+ *   ":shell:"   — only u:r:shell:s0 in stock policy
+ *   ":su:"      — only u:r:su:s0 (userdebug-only type)
+ *   ":adbd:"    — only u:r:adbd:s0
+ *   "adbroot"   — only u:r:adbroot:s0 / u:object_r:adbroot_prop:s0
+ */
+static bool is_userdebug_expansion_access_query(const char *q, size_t len)
+{
+    if (!q || !len)
+        return false;
+
+    /* shell → su transition */
+    if (contains_case_literal(q, len, ":shell:") &&
+        contains_case_literal(q, len, ":su:"))
+        return true;
+
+    /* adbd → adbroot binder */
+    if (contains_case_literal(q, len, ":adbd:") &&
+        contains_case_literal(q, len, "adbroot"))
+        return true;
+
+    return false;
+}
+
+static bool is_userdebug_expansion_context_query(const char *q, size_t len)
+{
+    if (!q || !len)
+        return false;
+
+    /* su context existence probe */
+    if (contains_case_literal(q, len, ":su:"))
+        return true;
+
+    /* adbroot context existence probe */
+    if (contains_case_literal(q, len, "adbroot"))
+        return true;
+
+    return false;
+}
 
 struct access_probe {
     u32 id;
@@ -1275,6 +1335,19 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid))
         return;
 
+    /* Block userdebug expansion probes (shell→su, adbd→adbroot) before
+     * entering the clean eval scope.  Return -EINVAL via after_sel_write_common
+     * so the caller sees "context does not exist", matching non-debug policy. */
+    if (is_userdebug_expansion_access_query(sample, ACCESS_SAMPLE_MAX)) {
+        a->local.data0 = 1;
+        if (!READ_ONCE(g_userdebug_expansion_detected)) {
+            WRITE_ONCE(g_userdebug_expansion_detected, true);
+            pr_info("[selinux_hook] DETECTED userdebug SELinux expansion "
+                    "(shell→su / adbd→adbroot in clean policy) — blocking policydb probes\n");
+        }
+        return;
+    }
+
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
@@ -1312,6 +1385,12 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid))
         return;
 
+    /* Block userdebug expansion context probes (u:r:su:s0, u:r:adbroot:s0). */
+    if (is_userdebug_expansion_context_query(sample, ACCESS_SAMPLE_MAX)) {
+        a->local.data0 = 1;
+        return;
+    }
+
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
@@ -1340,6 +1419,12 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
 
     if (!a->local.data0)
         return;
+
+    /* data0==1: blocked userdebug expansion probe — return EINVAL, skip logging. */
+    if ((u32)a->local.data0 == 1) {
+        a->ret = (uint64_t)(long)-EINVAL;
+        return;
+    }
 
     id = (u32)a->local.data1;
     slot = (u32)a->local.data2;
