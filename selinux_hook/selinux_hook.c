@@ -1280,8 +1280,10 @@ static bool is_userdebug_expansion_access_query(const char *q, size_t len)
     if (contains_case_literal(q, len, ":shell:") &&
         contains_case_literal(q, len, ":su:"))
         return true;
-    if (contains_case_literal(q, len, ":adbd:") &&
-        contains_case_literal(q, len, "adbroot"))
+    /* adbroot in any position — contextExists() probe 2 uses adbroot as
+     * both source AND target ("u:r:adbroot:s0 u:r:adbroot:s0 0"), so we
+     * cannot require :adbd: as the source. */
+    if (contains_case_literal(q, len, "adbroot"))
         return true;
     return false;
 }
@@ -1316,23 +1318,23 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid = current_uid();
     copy_query_sample(sample, query, size);
 
-    /* Block userdebug expansion probes (shell→su, adbd→adbroot) for ALL
-     * callers, including uid=0 (app_zygote holds uid=0 during the fork
-     * window before UID specialization, so this must precede the bypass
-     * check).  Returns -EINVAL via after_sel_write_common so the caller
-     * sees "context does not exist", matching non-debug policy. */
+    if (should_bypass_clean_filter(uid))
+        return;
+
+    /* Block userdebug expansion probes (shell→su, adbroot) for app-level
+     * callers.  app_zygote always carries the app's own uid (verified by
+     * AppZygote.java: uid == appInfo.uid), so it never bypasses above.
+     * System processes (adbd uid=2000, root uid=0) are intentionally
+     * excluded — they need real policy results for functional adb operation. */
     if (is_userdebug_expansion_access_query(sample, ACCESS_SAMPLE_MAX)) {
         a->local.data0 = 1;
         if (!READ_ONCE(g_userdebug_expansion_detected)) {
             WRITE_ONCE(g_userdebug_expansion_detected, true);
             pr_info("[selinux_hook] DETECTED userdebug SELinux expansion "
-                    "(shell→su / adbd→adbroot in clean policy) — blocking policydb probes\n");
+                    "(shell→su / adbroot in clean policy) — blocking policydb probes\n");
         }
         return;
     }
-
-    if (should_bypass_clean_filter(uid))
-        return;
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
@@ -1368,15 +1370,13 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     uid = current_uid();
     copy_query_sample(sample, query, size);
 
-    /* Same uid=0 / app_zygote concern as before_sel_write_access:
-     * block before the bypass check. */
+    if (should_bypass_clean_filter(uid))
+        return;
+
     if (is_userdebug_expansion_context_query(sample, ACCESS_SAMPLE_MAX)) {
         a->local.data0 = 1;
         return;
     }
-
-    if (should_bypass_clean_filter(uid))
-        return;
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
