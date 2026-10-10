@@ -1316,12 +1316,11 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid = current_uid();
     copy_query_sample(sample, query, size);
 
-    if (should_bypass_clean_filter(uid))
-        return;
-
-    /* Block userdebug expansion probes (shell→su, adbd→adbroot) before
-     * entering the clean eval scope.  Return -EINVAL via after_sel_write_common
-     * so the caller sees "context does not exist", matching non-debug policy. */
+    /* Block userdebug expansion probes (shell→su, adbd→adbroot) for ALL
+     * callers, including uid=0 (app_zygote holds uid=0 during the fork
+     * window before UID specialization, so this must precede the bypass
+     * check).  Returns -EINVAL via after_sel_write_common so the caller
+     * sees "context does not exist", matching non-debug policy. */
     if (is_userdebug_expansion_access_query(sample, ACCESS_SAMPLE_MAX)) {
         a->local.data0 = 1;
         if (!READ_ONCE(g_userdebug_expansion_detected)) {
@@ -1331,6 +1330,9 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         }
         return;
     }
+
+    if (should_bypass_clean_filter(uid))
+        return;
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
@@ -1366,14 +1368,15 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     uid = current_uid();
     copy_query_sample(sample, query, size);
 
-    if (should_bypass_clean_filter(uid))
-        return;
-
-    /* Block userdebug expansion context probes (u:r:su:s0, u:r:adbroot:s0). */
+    /* Same uid=0 / app_zygote concern as before_sel_write_access:
+     * block before the bypass check. */
     if (is_userdebug_expansion_context_query(sample, ACCESS_SAMPLE_MAX)) {
         a->local.data0 = 1;
         return;
     }
+
+    if (should_bypass_clean_filter(uid))
+        return;
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
