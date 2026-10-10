@@ -1538,6 +1538,7 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs4_t *a, void *u)
     u32 n;
 
     a->local.data0 = 0;
+    a->local.data1 = 0; /* userdebug expansion flag for after hook */
 
     n = READ_ONCE(g_selinux_setprocattr_probe_count);
     if (n < 16) {
@@ -1551,6 +1552,29 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
         return;
 
+    /*
+     * contextExists() in SELinux.java has three fallback probes.  Probes 1
+     * (/sys/fs/selinux/context) and 2 (/sys/fs/selinux/access class=0) are
+     * blocked in before_sel_write_{context,access}.  Probe 3 writes the
+     * context to /proc/self/attr/current and infers type validity from errno:
+     *   EINVAL → type unknown in policy  → contextExists() == false
+     *   EPERM  → type known, transition denied → contextExists() == true
+     *
+     * On userdebug, u:r:adbroot:s0 (and u:r:su:s0) ARE in the clean policy,
+     * so string_to_context_struct succeeds in the clean eval scope and the
+     * kernel returns EPERM.  Java interprets EPERM as "found" — false positive.
+     *
+     * Fix: flag the userdebug expansion context here; the after hook overrides
+     * the real return value to EINVAL, making Java see "type unknown".
+     */
+    {
+        const char *value = (kver < VERSION(4, 14, 0))
+                            ? (const char *)a->arg2   /* 4-arg: task,name,value,size */
+                            : (const char *)a->arg1;  /* 3-arg: name,value,size */
+        if (value && is_userdebug_expansion_context_query(value, ACCESS_SAMPLE_MAX))
+            a->local.data1 = 1;
+    }
+
     if (enter_clean_eval_scope())
         a->local.data0 = 1;
 }
@@ -1559,6 +1583,13 @@ static void after_selinux_setprocattr_clean_eval(hook_fargs4_t *a, void *u)
 {
     if (a->local.data0)
         leave_clean_eval_scope();
+    /*
+     * Probe 3 fallback: if the context was a userdebug expansion type, the
+     * kernel returned EPERM (type exists, transition denied).  Override to
+     * EINVAL so Java's contextExists() sees "type unknown in policy".
+     */
+    if (a->local.data1)
+        a->ret = (uint64_t)(long)-EINVAL;
 }
 
 /*
